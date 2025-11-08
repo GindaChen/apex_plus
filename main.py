@@ -29,6 +29,7 @@ SHORTCUT = {
     "mixtral-8x22b-local": "./apex_plus/models/mixtral8x22b_config.json",
     "mixtral-8x22b": "mistral-community/Mixtral-8x22B-v0.1-AWQ",
     "llama3.1-70b": "./apex_plus/models/llama3.1_70b_config.json",
+    "qwen2.5-32b": "Qwen/Qwen2.5-32B",
 }
 
 

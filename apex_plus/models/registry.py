@@ -17,6 +17,7 @@ from apex_plus.models.mistral import Mistral
 from apex_plus.models.mixtral import Mixtral
 from apex_plus.models.t5 import T5
 from apex_plus.models.llama3 import LLaMA3
+from apex_plus.models.qwen2 import Qwen2
 
 _MODEL_REGISTRY = {
     "BloomForCausalLM": Bloom,
@@ -32,6 +33,8 @@ _MODEL_REGISTRY = {
     "MixtralForCausalLM": Mixtral,
     "T5ForConditionalGeneration": T5,
     "Llama3ForCausalLM": LLaMA3,
+    "Qwen2ForCausalLM": Qwen2,
+    "Qwen2_5ForCausalLM": Qwen2,
 }
 
 

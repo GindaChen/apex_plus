@@ -28,6 +28,9 @@ Run `main.py` in the root directory of the repository. We can simulate various m
 # Simulate the decoder-only model llama3-70b; the ``--all`` flag prints the simulation results of all the execution plans, otherwise only the latency-optimal plan is printed
 python main.py --model llama3-70b --num-gpus-per-node 2 --prompt-len 128 --output-len 2048 --all
 
+# Simulate Qwen2.5-32B
+python main.py --model qwen2.5-32b --num-gpus-per-node 2 --prompt-len 128 --output-len 2048
+
 # Simulate the encoder-decoder model Whisper
 python main.py --model whisper --num-gpus-per-node 2 --prompt-len 128 --output-len 2048
 

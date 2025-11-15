@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import List, Optional
 import json
 import csv
 from datetime import datetime
@@ -37,6 +37,7 @@ class Request:
     input_len: int
     output_len: int
     time_stamp: int  # offset to the first request in nanosec.
+    hash_ids: List[int] = field(default_factory=list)  # List of cached block IDs for prefix caching
 
 
 class Trace:
@@ -54,7 +55,7 @@ class Trace:
         input_len: int,
         output_len: int,
     ) -> "Trace":
-        requests = [Request(input_len, output_len, 0) for _ in range(num_requests)]
+        requests = [Request(input_len, output_len, 0, hash_ids=[]) for _ in range(num_requests)]
         return cls(requests)
 
     @classmethod
@@ -67,17 +68,33 @@ class Trace:
             with open(file_path, "r") as file:
                 for line in file:
                     data = json.loads(line)
-                    requests.append(
-                        Request(
-                            data.get("ContextTokens"),
-                            data.get("GeneratedTokens"),
-                            int(1 * (data.get("StartTimeOffset")) // 1e3),
+                    # Check if this is mooncake format (has hash_ids)
+                    if "hash_ids" in data:
+                        # Mooncake format: timestamp (ms), input_length, output_length, hash_ids
+                        timestamp_ms = data.get("timestamp", 0)
+                        timestamp_us = int(timestamp_ms * 1e3)  # Convert ms to microseconds
+                        requests.append(
+                            Request(
+                                data.get("input_length"),
+                                data.get("output_length"),
+                                timestamp_us,
+                                hash_ids=data.get("hash_ids", []),
+                            )
                         )
-                    )  # ns -> us
+                    else:
+                        # Existing format: ContextTokens, GeneratedTokens, StartTimeOffset
+                        requests.append(
+                            Request(
+                                data.get("ContextTokens"),
+                                data.get("GeneratedTokens"),
+                                int(1 * (data.get("StartTimeOffset")) // 1e3),
+                                hash_ids=[],
+                            )
+                        )  # ns -> us
         elif file_path.endswith(".csv"):
             offsets = parse_csv(file_path)
             for req in offsets:
-                requests.append(Request(int(req[1]), int(req[2]), int(req[0] * 1e6)))
+                requests.append(Request(int(req[1]), int(req[2]), int(req[0] * 1e6), hash_ids=[]))
         else:
             print("Unsupported file format")
 

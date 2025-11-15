@@ -232,7 +232,11 @@ class SearchEngine:
 
         outputs: List[Tuple[ExecutionPlan, SimulatorOutput]] = []
         slo_targets = [ttft_slo, tpot_slo]
-        for plan in tqdm(candidate_plans):
+        for plan_idx, plan in enumerate(tqdm(candidate_plans, desc="Evaluating plans")):
+            parallel_schedule = plan.parallel_schedule
+            print(f"\n[Plan {plan_idx + 1}/{len(candidate_plans)}] "
+                  f"Replicas: {parallel_schedule.num_model_replicas}, "
+                  f"Stages: {parallel_schedule.num_stages}")
             requests, output = self.simulator.simulate(
                 plan,
                 self.arch,
@@ -244,7 +248,9 @@ class SearchEngine:
                 max_batch_size)
             if output is None:
                 # Invalid plan (e.g., when the model does not fit in memory).
+                print(f"  [REJECTED] Plan {plan_idx + 1} is invalid (see reason above)")
                 continue
+            print(f"  [VALID] Plan {plan_idx + 1} succeeded!")
             outputs.append((plan, output))
 
         if not outputs:

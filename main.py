@@ -5,6 +5,7 @@ from apex_plus.models.registry import get_model_ir
 from apex_plus.search.engine import SearchEngine
 from apex_plus.simulator.trace import Trace
 from apex_plus.utils.dtype import DTYPE, _DTYPE_REGISTRY
+from apex_plus.utils.logger import setup_debug_logger
 
 # NOTE: This is not a complete list of supported models.
 SHORTCUT = {
@@ -38,6 +39,11 @@ def get_model_shortcuts():
 
 
 def main(args: argparse.Namespace):
+    # Setup debug logging if enabled via environment variable
+    logger = setup_debug_logger()
+    if logger:
+        logger.info(f"Starting APEX+ simulation with args: {args}")
+    
     if args.model in SHORTCUT:
         args.model = SHORTCUT[args.model]
     print(args)

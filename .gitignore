@@ -1,2 +1,4 @@
 *.pyc
 .DS_Store
+my_debug.log
+output.txt

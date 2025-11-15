@@ -6,6 +6,7 @@ import pandas as pd
 from apex_plus.ir.tasks.attention import MHAHead
 from apex_plus.ir.tasks.ffn import MLPFilter, GLUFilter, SwiGLUFilter
 from apex_plus.utils.dtype import DTYPE, dtype_to_str
+from apex_plus.utils.logger import debug_log, warning_log
 
 GEMM_TMPL = "profile/comp/{gpu}/gemm_{freq}.csv"  # e.g. gemm_1980.csv
 MHA_TMPL = "profile/comp/{gpu}/mha_{freq}.csv"
@@ -54,6 +55,75 @@ def _interpolate(
         if len(large) == 0 and len(small) != 0:
             return small.iloc[-1][target_col]
         else:
+            # Both empty - try to find closest points for interpolation
+            # First, try to find points with same col1, interpolate on col2
+            df_col1 = df[df[col1] == col1_val]
+            if len(df_col1) > 0:
+                # Interpolate on col2 only
+                small_col2 = df_col1[df_col1[col2] <= col2_val]
+                large_col2 = df_col1[df_col1[col2] >= col2_val]
+                if len(small_col2) > 0 and len(large_col2) > 0:
+                    small_val = small_col2.iloc[-1][target_col]
+                    large_val = large_col2.iloc[0][target_col]
+                    small_col2_val = small_col2.iloc[-1][col2]
+                    large_col2_val = large_col2.iloc[0][col2]
+                    if small_col2_val == large_col2_val:
+                        return small_val
+                    r = (col2_val - small_col2_val) / (large_col2_val - small_col2_val)
+                    return small_val * (1 - r) + large_val * r
+                elif len(small_col2) > 0:
+                    return small_col2.iloc[-1][target_col]
+                elif len(large_col2) > 0:
+                    return large_col2.iloc[0][target_col]
+            
+            # Second, try to find points with same col2, interpolate on col1
+            df_col2 = df[df[col2] == col2_val]
+            if len(df_col2) > 0:
+                # Interpolate on col1 only
+                small_col1 = df_col2[df_col2[col1] <= col1_val]
+                large_col1 = df_col2[df_col2[col1] >= col1_val]
+                if len(small_col1) > 0 and len(large_col1) > 0:
+                    small_val = small_col1.iloc[-1][target_col]
+                    large_val = large_col1.iloc[0][target_col]
+                    small_col1_val = small_col1.iloc[-1][col1]
+                    large_col1_val = large_col1.iloc[0][col1]
+                    if small_col1_val == large_col1_val:
+                        return small_val
+                    r = (col1_val - small_col1_val) / (large_col1_val - small_col1_val)
+                    return small_val * (1 - r) + large_val * r
+                elif len(small_col1) > 0:
+                    return small_col1.iloc[-1][target_col]
+                elif len(large_col1) > 0:
+                    return large_col1.iloc[0][target_col]
+            
+            # Third, try to interpolate on col2 with closest col1 values
+            # Find closest col1 values
+            unique_col1 = sorted(df[col1].unique())
+            if len(unique_col1) >= 2:
+                # Find col1 values that bracket col1_val
+                small_col1_vals = [v for v in unique_col1 if v <= col1_val]
+                large_col1_vals = [v for v in unique_col1 if v >= col1_val]
+                if len(small_col1_vals) > 0 and len(large_col1_vals) > 0:
+                    small_col1_val = max(small_col1_vals)
+                    large_col1_val = min(large_col1_vals)
+                    # Get data for these col1 values and interpolate on col2
+                    df_small_col1 = df[df[col1] == small_col1_val]
+                    df_large_col1 = df[df[col1] == large_col1_val]
+                    small_col2 = df_small_col1[df_small_col1[col2] <= col2_val]
+                    large_col2 = df_small_col1[df_small_col1[col2] >= col2_val]
+                    if len(small_col2) > 0 and len(large_col2) > 0:
+                        val1 = small_col2.iloc[-1][target_col] * (1 - (col1_val - small_col1_val) / (large_col1_val - small_col1_val)) if small_col1_val != large_col1_val else small_col2.iloc[-1][target_col]
+                        val2 = large_col2.iloc[0][target_col] * ((col1_val - small_col1_val) / (large_col1_val - small_col1_val)) if small_col1_val != large_col1_val else large_col2.iloc[0][target_col]
+                        # Interpolate on col2
+                        r2 = (col2_val - small_col2.iloc[-1][col2]) / (large_col2.iloc[0][col2] - small_col2.iloc[-1][col2])
+                        return val1 * (1 - r2) + val2 * r2
+            
+            # Last resort: find closest point by Euclidean distance
+            if len(df) > 0:
+                df['distance'] = ((df[col1] - col1_val) ** 2 + (df[col2] - col2_val) ** 2) ** 0.5
+                closest = df.nsmallest(1, 'distance').iloc[0]
+                return closest[target_col]
+            
             raise ValueError(
                 "Cannot interpolate. "
                 f"col1: {col1}, col1_val: {col1_val}, "
@@ -88,15 +158,57 @@ def _gemm_time(
 ) -> float:
     df = _gemm_df(gpu,frequency)
     df = df[df["dtype"] == dtype]
-    df = df[df["n"] == n]
-    assert (
-        not df.empty
-    ), f"Cannot find gemm time for {gpu}, freq={frequency}, {dtype},{m},{k},{n}"
-    exe_time = _interpolate(df, "m", m, "k", k, "time(us)")
-    # Get energy consumption if profiling exist; otherwise return energy = 0
-    exe_energy = (
-        _interpolate(df, "m", m, "k", k, "avg_energy(uJ)") if frequency != 0 else 0
-    )
+    
+    # Check if n exceeds the profiled range
+    available_n_values = sorted(df["n"].unique())
+    max_profiled_n = max(available_n_values) if available_n_values else n
+    
+    if n > max_profiled_n:
+        # Use linear extrapolation: find data at max_profiled_n and scale by n ratio
+        df_max_n = df[df["n"] == max_profiled_n]
+        assert (
+            not df_max_n.empty
+        ), f"Cannot find gemm time for {gpu}, freq={frequency}, {dtype}, n={max_profiled_n}"
+        
+        # Get time at max_profiled_n and scale linearly by n ratio
+        time_at_max = _interpolate(df_max_n, "m", m, "k", k, "time(us)")
+        exe_time = time_at_max * (n / max_profiled_n)
+        debug_log(f"[TIME] GEMM extrapolation: n={n} > max_profiled_n={max_profiled_n}, "
+                  f"time_at_max={time_at_max:.2f}us, exe_time={exe_time:.2f}us")
+        if exe_time < 0:
+            warning_log(f"[⚠️ALERT] NEGATIVE TIME detected in GEMM extrapolation! exe_time={exe_time:.2f}us")
+        
+        # Energy extrapolation (same approach)
+        if frequency != 0:
+            energy_at_max = _interpolate(df_max_n, "m", m, "k", k, "avg_energy(uJ)")
+            exe_energy = energy_at_max * (n / max_profiled_n)
+            debug_log(f"[ENERGY] GEMM extrapolation: n={n} > max_profiled_n={max_profiled_n}, "
+                      f"energy_at_max={energy_at_max:.2f}uJ, exe_energy={exe_energy:.2f}uJ")
+            if exe_energy < 0:
+                warning_log(f"[⚠️ALERT] NEGATIVE ENERGY detected in GEMM extrapolation! exe_energy={exe_energy:.2f}uJ")
+        else:
+            exe_energy = 0
+    else:
+        # Normal case: n is within profiled range
+        df = df[df["n"] == n]
+        assert (
+            not df.empty
+        ), f"Cannot find gemm time for {gpu}, freq={frequency}, {dtype},{m},{k},{n}"
+        exe_time = _interpolate(df, "m", m, "k", k, "time(us)")
+        debug_log(f"[TIME] GEMM interpolation: m={m}, k={k}, n={n}, frequency={frequency}, "
+                  f"exe_time={exe_time:.2f}us")
+        if exe_time < 0:
+            warning_log(f"[⚠️ALERT] NEGATIVE TIME detected in GEMM interpolation! exe_time={exe_time:.2f}us")
+        # Get energy consumption if profiling exist; otherwise return energy = 0
+        if frequency != 0:
+            exe_energy = _interpolate(df, "m", m, "k", k, "avg_energy(uJ)")
+            debug_log(f"[ENERGY] GEMM interpolation: m={m}, k={k}, n={n}, frequency={frequency}, "
+                      f"exe_energy={exe_energy:.2f}uJ")
+            if exe_energy < 0:
+                warning_log(f"[⚠️ALERT] NEGATIVE ENERGY detected in GEMM interpolation! exe_energy={exe_energy:.2f}uJ")
+        else:
+            exe_energy = 0
+    
     return exe_time, exe_energy
 
 
@@ -156,6 +268,10 @@ def attn_time(
     ), f"Cannot find attn time for {gpu}, {dtype}, {head_size}, {frequency}"
     # Round up to the nearest multiple of 16.
     seq_len = (seq_len + 15) // 16 * 16
+    # If seq_len exceeds max in profiling data, use the maximum available
+    max_seq_len = df["seq_len"].max()
+    if seq_len > max_seq_len:
+        seq_len = max_seq_len
     df = df[df["seq_len"] == seq_len]
 
     exe_time = _interpolate(
@@ -210,12 +326,21 @@ def mha_time(
     dtype: DTYPE,
     input_lens: List[int],
     cached_lens: List[int],
+    prefix_cached_tokens: List[int],
     masked: bool,  # True for MHA and False for BiMHA
 ) -> float:
     if not heads:
         return 0.0
     if not input_lens:
         return 0.0
+
+    # Ensure prefix_cached_tokens is aligned with input_lens
+    if len(prefix_cached_tokens) != len(input_lens):
+        # Pad with zeros if shorter, truncate if longer
+        if len(prefix_cached_tokens) < len(input_lens):
+            prefix_cached_tokens = prefix_cached_tokens + [0] * (len(input_lens) - len(prefix_cached_tokens))
+        else:
+            prefix_cached_tokens = prefix_cached_tokens[:len(input_lens)]
 
     dtype_str = dtype_to_str(dtype)
     # Synthetic results for attention for MHA in FP8 (temporary)
@@ -229,51 +354,77 @@ def mha_time(
     num_total_input_tokens = sum(input_lens)
     total_time = 0.0
     total_energy = 0.0
-    # 1. QKV Linear
-    exe_time, exe_energy = gemm_time(
-        gpu=gpu,
-        frequency=frequency,
-        m=3 * num_heads * head_size,
-        k=hidden_size,
-        n=num_total_input_tokens,
-        dtype=dtype_str,
-    )
-    total_time += exe_time
-    total_energy += exe_energy
+    
+    # 1. QKV Linear - split computation for cached vs non-cached tokens
+    # For cached tokens: only compute Q (1/3 of QKV computation)
+    # For non-cached tokens: compute full QKV
+    total_cached_tokens = sum(prefix_cached_tokens)
+    total_non_cached_tokens = num_total_input_tokens - total_cached_tokens
+    
+    # Compute QKV for non-cached tokens (full QKV)
+    if total_non_cached_tokens > 0:
+        exe_time, exe_energy = gemm_time(
+            gpu=gpu,
+            frequency=frequency,
+            m=3 * num_heads * head_size,
+            k=hidden_size,
+            n=total_non_cached_tokens,
+            dtype=dtype_str,
+        )
+        total_time += exe_time
+        total_energy += exe_energy
+    
+    # Compute only Q for cached tokens (1/3 of QKV computation)
+    if total_cached_tokens > 0:
+        exe_time, exe_energy = gemm_time(
+            gpu=gpu,
+            frequency=frequency,
+            m=num_heads * head_size,  # Only Q, not QKV
+            k=hidden_size,
+            n=total_cached_tokens,
+            dtype=dtype_str,
+        )
+        total_time += exe_time
+        total_energy += exe_energy
 
     # 2. Attention
     prompt_indices = [i for i in range(len(input_lens)) if cached_lens[i] == 0]
     if prompt_indices:
         prompt_batch_size = len(prompt_indices)
-        prompt_seq_len = sum(input_lens[i] for i in prompt_indices) / prompt_batch_size
-
-        if masked:
-            attention_time, attention_energy = attn_time(
-                gpu=gpu,
-                frequency=frequency,
-                head_size=head_size,
-                num_heads=num_heads,
-                batch_size=prompt_batch_size,
-                seq_len=prompt_seq_len,
-                dtype=atten_dtype,
+        # Attention uses FULL sequence length (cached + non-cached) because
+        # Q needs to attend to the entire KV cache (cached KV + new KV)
+        total_prompt_tokens = sum(input_lens[i] for i in prompt_indices)
+        prompt_seq_len = total_prompt_tokens / prompt_batch_size
+        
+        # Only compute attention if there are tokens to process
+        if prompt_seq_len > 0:
+            if masked:
+                attention_time, attention_energy = attn_time(
+                    gpu=gpu,
+                    frequency=frequency,
+                    head_size=head_size,
+                    num_heads=num_heads,
+                    batch_size=prompt_batch_size,
+                    seq_len=prompt_seq_len,
+                    dtype=atten_dtype,
+                )
+            else:
+                attention_time, attention_energy = bi_attn_time(
+                    gpu=gpu,
+                    frequency=frequency,
+                    head_size=head_size,
+                    num_heads=num_heads,
+                    batch_size=prompt_batch_size,
+                    seq_len=prompt_seq_len,
+                    dtype=atten_dtype,
+                )
+            # Synthetic results for attention for MHA in FP8 (temporary)
+            # Synethetic FP8 = Result of FP16/1.5
+            attention_time = (
+                (attention_time / 1.5) if dtype == DTYPE.FLOAT8 else attention_time
             )
-        else:
-            attention_time, attention_energy = bi_attn_time(
-                gpu=gpu,
-                frequency=frequency,
-                head_size=head_size,
-                num_heads=num_heads,
-                batch_size=prompt_batch_size,
-                seq_len=prompt_seq_len,
-                dtype=atten_dtype,
-            )
-        # Synthetic results for attention for MHA in FP8 (temporary)
-        # Synethetic FP8 = Result of FP16/1.5
-        attention_time = (
-            (attention_time / 1.5) if dtype == DTYPE.FLOAT8 else attention_time
-        )
-        total_time += attention_time
-        total_energy += attention_energy
+            total_time += attention_time
+            total_energy += attention_energy
 
     # 3. Cached Attention
     decoding_indices = [i for i in range(len(input_lens)) if cached_lens[i] > 0]

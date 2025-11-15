@@ -15,15 +15,47 @@ from apex_plus.simulator.comm_profile import get_comm_time, get_p2p_comm_time
 from apex_plus.simulator.comp_profile import mha_time, mlp_time, glu_time, swiglu_time
 from apex_plus.simulator.trace import Trace, Request
 from apex_plus.utils.dtype import DTYPE
+from apex_plus.utils.logger import debug_log, warning_log
 
 GB = 1024 * 1024 * 1024
 WORKSPACE = 1 * GB  # a constant buffer for each device to run the program
 
-MAX_NUM_INPUT_TOKENS = 64 * 1024  # Max in profile/scripts/gemm.py
+MAX_NUM_INPUT_TOKENS = 256 * 1024  # Max in profile/scripts/gemm.py
 
 US_TO_SEC = 1000000
 MS_TO_SEC = 1000
 US_TO_MS = 1000
+
+
+class PrefixCache:
+    """Tracks cached prefix blocks for prefix caching optimization."""
+    
+    def __init__(self, block_size: int = 256):
+        self.cached_blocks: set = set()  # Set of block IDs that are cached
+        self.block_size: int = block_size  # Tokens per block
+    
+    def is_cached(self, block_id: int) -> bool:
+        """Check if a block ID is cached."""
+        return block_id in self.cached_blocks
+    
+    def get_cached_tokens(self, hash_ids: List[int]) -> int:
+        """Calculate the number of cached tokens for a given list of hash_ids.
+        
+        Args:
+            hash_ids: List of block IDs that are cached for this request
+            
+        Returns:
+            Number of tokens that are cached (len(hash_ids) * block_size)
+        """
+        if not hash_ids:
+            return 0
+        # For now, assume all blocks in hash_ids are cached
+        # In the future, we can check self.cached_blocks to see which are actually cached
+        return len(hash_ids) * self.block_size
+    
+    def add_blocks(self, block_ids: List[int]):
+        """Add blocks to the cache. For now, all blocks persist."""
+        self.cached_blocks.update(block_ids)
 
 
 @dataclass
@@ -334,6 +366,13 @@ class Simulator:
         ]
         if any(avail_mem < 0 for avail_mem in available_memories):
             # Invalid.
+            min_avail = min(available_memories)
+            max_param = max(param_sizes)
+            print(f"  [REJECTED] Plan failed: Model weights don't fit in memory. "
+                  f"GPU memory: {self.gpu_memory/GB:.1f}GB, "
+                  f"Max param size: {max_param/GB:.1f}GB, "
+                  f"Workspace: {WORKSPACE/GB:.1f}GB, "
+                  f"Available: {min_avail/GB:.1f}GB (negative!)")
             return None
         min_available_memory = min(available_memories) + WORKSPACE
         param_size = max(param_sizes)
@@ -351,6 +390,13 @@ class Simulator:
         )
         # Evenly partition the KV cache for each stage.
         max_num_tokens_per_stage = max_num_tokens // num_stages
+        
+        # Log KV cache capacity for debugging
+        if num_stages > 1:
+            print(f"  [INFO] KV cache capacity: {max_num_tokens:,} tokens total, "
+                  f"{max_num_tokens_per_stage:,} tokens per stage (with {num_stages} stages)")
+        else:
+            print(f"  [INFO] KV cache capacity: {max_num_tokens:,} tokens per device")
 
         # Statistics
         list_of_exe_time = []
@@ -416,15 +462,43 @@ class Simulator:
                     num_reqs_per_iteration.append(reqs_per_iter)
                     num_tokens_per_iteration.append(tokens_per_iter)
                     list_of_exe_time.append(exe_time)
-                    model_replica_energy += (
-                        stage_energy // num_attn_cell_replicas * num_stages
-                    )
-                    # Note: dividied by cell replicas as the energy scaling of cell is already handled in Line 693
+                    energy_before = model_replica_energy
+                    energy_increment = stage_energy * num_stages / num_attn_cell_replicas
+                    model_replica_energy += energy_increment
+                    if frequency != 0 and energy_increment != 0:
+                        debug_log(f"[ENERGY] simulate: stage_energy={stage_energy:.2f}uJ, "
+                                  f"num_stages={num_stages}, num_attn_cell_replicas={num_attn_cell_replicas}, "
+                                  f"energy_increment={energy_increment:.2f}uJ, "
+                                  f"model_replica_energy={model_replica_energy:.2f}uJ (accumulated)")
+                        if stage_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE stage_energy! stage_energy={stage_energy:.2f}uJ")
+                        if energy_increment < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY increment in simulate! "
+                                        f"stage_energy={stage_energy:.2f}uJ, num_stages={num_stages}, "
+                                        f"num_attn_cell_replicas={num_attn_cell_replicas}, "
+                                        f"energy_increment={energy_increment:.2f}uJ")
+                        if model_replica_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in model_replica! "
+                                         f"energy_before={energy_before:.2f}uJ, energy_increment={energy_increment:.2f}uJ, "
+                                         f"model_replica_energy={model_replica_energy:.2f}uJ")
+                    # Note: divided by cell replicas as the energy scaling of cell is already handled in Line 693
                     # Multiplied with num_stages because we only simulate one stage, but num_stages run concurrently
 
                 # iteration time = slowest among the cell replicas
                 max_cell_iter_time = self.merge_max_elements(cell_replica_iter_times)
                 stage_iter_times.append(max_cell_iter_time)
+                # max_cell_iter_time might be a list or a float, handle both
+                if isinstance(max_cell_iter_time, list):
+                    max_time_val = max(max_cell_iter_time) if max_cell_iter_time else 0.0
+                    debug_log(f"[TIME] simulate: max_cell_iter_time={max_cell_iter_time}, "
+                              f"max_time_val={max_time_val:.2f}us, cell_replica_iter_times={cell_replica_iter_times}")
+                    if max_time_val < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE max_cell_iter_time! max_time_val={max_time_val:.2f}us")
+                else:
+                    debug_log(f"[TIME] simulate: max_cell_iter_time={max_cell_iter_time:.2f}us, "
+                              f"cell_replica_iter_times={cell_replica_iter_times}")
+                    if max_cell_iter_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE max_cell_iter_time! max_cell_iter_time={max_cell_iter_time:.2f}us")
 
             interleaved_list = [
                 val
@@ -441,11 +515,33 @@ class Simulator:
                 for i in range(len(interleaved_list) - num_stages):
                     window = interleaved_list[i : i + num_stages]
                     model_replica_iter_times.append(max(window))
-            model_replica_time.append(sum(model_replica_iter_times))
+            model_replica_time_sum = sum(model_replica_iter_times)
+            model_replica_time.append(model_replica_time_sum)
+            debug_log(f"[TIME] simulate: model_replica_iter_times={model_replica_iter_times}, "
+                      f"model_replica_time_sum={model_replica_time_sum:.2f}us")
+            if model_replica_time_sum < 0:
+                warning_log(f"[⚠️ALERT] NEGATIVE model_replica_time_sum! "
+                            f"model_replica_time_sum={model_replica_time_sum:.2f}us")
+            energy_before = total_energy
             total_energy += model_replica_energy
+            if frequency != 0 and model_replica_energy != 0:
+                debug_log(f"[ENERGY] simulate: model_replica_energy={model_replica_energy:.2f}uJ, "
+                          f"total_energy_before={energy_before:.2f}uJ, "
+                          f"total_energy_after={total_energy:.2f}uJ")
+                if model_replica_energy < 0:
+                    warning_log(f"[⚠️ALERT] NEGATIVE model_replica_energy being added! "
+                                f"model_replica_energy={model_replica_energy:.2f}uJ")
+                if total_energy < 0:
+                    warning_log(f"[⚠️ALERT] NEGATIVE total_energy! "
+                                f"energy_before={energy_before:.2f}uJ, model_replica_energy={model_replica_energy:.2f}uJ, "
+                                f"total_energy_after={total_energy:.2f}uJ")
 
         # Final execution time = the slowest among the replicas
         total_time = max(model_replica_time)
+        debug_log(f"[TIME] simulate: model_replica_time={model_replica_time}, "
+                  f"total_time={total_time:.2f}us")
+        if total_time < 0:
+            warning_log(f"[⚠️ALERT] NEGATIVE total_time! total_time={total_time:.2f}us")
 
         ### Finished simulation; calculate the statistics of the results ###
 
@@ -536,6 +632,9 @@ class Simulator:
         num_generated_tokens: Dict[int, int] = {}  # request_id -> num_tokens
         running: List[int] = []  # request_ids
         stopped: List[int] = []  # request_ids
+        
+        # Initialize prefix cache
+        prefix_cache = PrefixCache(block_size=256)
 
         get_seq_len = lambda request_id: (
             requests[request_id].input_len + num_generated_tokens[request_id]
@@ -565,6 +664,7 @@ class Simulator:
             # Batch requests.
             input_lens: List[int] = []
             cached_lens: List[int] = []
+            prefix_cached_tokens: List[int] = []  # Track cached prefix tokens per request
 
             new_running: List[int] = []
             while running:
@@ -582,6 +682,8 @@ class Simulator:
                     input_lens.append(1)
                     num_cached_tokens += 1
                     cached_lens.append(num_generated_tokens[request_id] + 1)
+                    # For decoding, no prefix cache (already used during prefill)
+                    prefix_cached_tokens.append(0)
                     new_running.append(request_id)
             running = new_running
 
@@ -597,6 +699,8 @@ class Simulator:
                 input_lens.append(1)
                 num_cached_tokens += seq_len + 1
                 cached_lens.append(num_generated_tokens[request_id] + 1)
+                # For decoding, no prefix cache
+                prefix_cached_tokens.append(0)
                 running.append(request_id)
 
             # Batch new requests.
@@ -627,6 +731,13 @@ class Simulator:
                     num_cached_tokens += input_len
                     input_lens.append(input_len)
                     cached_lens.append(0)
+                    # Calculate prefix cached tokens for this new request
+                    hash_ids = requests[request_id].hash_ids
+                    cached_prefix = prefix_cache.get_cached_tokens(hash_ids)
+                    prefix_cached_tokens.append(cached_prefix)
+                    # Add blocks to cache (for future requests)
+                    if hash_ids:
+                        prefix_cache.add_blocks(hash_ids)
                     running.append(request_id)
 
                     num_generated_tokens[request_id] = 0
@@ -638,7 +749,11 @@ class Simulator:
                     # This can happen when the space for the KV cache is
                     # too small to store even a single sequence.
                     if num_cached_tokens + input_len > max_num_tokens_per_stage:
-                        return None, None, None, None, None, None
+                        print(f"  [REJECTED] Plan failed: KV cache too small for single sequence. "
+                              f"Request {req_counter} needs {input_len:,} tokens, "
+                              f"but only {max_num_tokens_per_stage:,} tokens available per stage. "
+                              f"Already cached: {num_cached_tokens:,} tokens")
+                        return None, None, None, None, None, None, None
                     else:
                         # Or because the requests are coming too slow;
                         # wait until next request comes.
@@ -648,7 +763,15 @@ class Simulator:
                             )
                             internal_clock = requests[req_counter].time_stamp
                         else:
-                            return None, None, None, None, None, None
+                            # Edge case: Request has arrived and KV cache has space,
+                            # but batching loop exited. This should not happen now that
+                            # we allow tokens beyond MAX_NUM_INPUT_TOKENS.
+                            input_len = requests[req_counter].input_len
+                            print(f"  [REJECTED] Plan failed: Cannot process request {req_counter} individually. "
+                                  f"KV cache OK ({num_cached_tokens + input_len:,} <= {max_num_tokens_per_stage:,}), "
+                                  f"request arrived (timestamp {requests[req_counter].time_stamp} <= {internal_clock}), "
+                                  f"but batching loop exited. This may indicate a logic bug.")
+                            return None, None, None, None, None, None, None
 
                 else:
                     # All the requests are finished.
@@ -667,6 +790,7 @@ class Simulator:
                     num_attn_cell_replicas,
                     input_lens,
                     cached_lens,
+                    prefix_cached_tokens,
                     self.gpu,
                     frequency,
                     self.cluster_size_per_node,
@@ -680,10 +804,40 @@ class Simulator:
                             self.cluster_size_per_node,
                         )
                     )
-                time_per_iteration.append(sum(stage_execution_time))
-                internal_clock += sum(stage_execution_time)
-                energy += sum(stage_energy)
+                time_increment = sum(stage_execution_time)
+                time_per_iteration.append(time_increment)
+                time_before = internal_clock
+                internal_clock += time_increment
+                debug_log(f"[TIME] sub_simulate iteration: time_increment={time_increment:.2f}us, "
+                          f"time_before={time_before:.2f}us, time_after={internal_clock:.2f}us")
+                if time_increment < 0:
+                    warning_log(f"[⚠️ALERT] NEGATIVE TIME increment in sub_simulate! "
+                                f"time_increment={time_increment:.2f}us, stage_execution_time={stage_execution_time}")
+                if internal_clock < 0:
+                    warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in sub_simulate! "
+                                f"time_before={time_before:.2f}us, time_increment={time_increment:.2f}us, "
+                                f"time_after={internal_clock:.2f}us")
+                energy_before = energy
+                energy_increment = sum(stage_energy)
+                energy += energy_increment
+                if frequency != 0 and energy_increment != 0:
+                    debug_log(f"[ENERGY] sub_simulate iteration: energy_increment={energy_increment:.2f}uJ, "
+                              f"energy_before={energy_before:.2f}uJ, energy_after={energy:.2f}uJ")
+                    if energy_increment < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE ENERGY increment in sub_simulate! "
+                                    f"energy_increment={energy_increment:.2f}uJ, stage_energy={stage_energy}")
+                    if energy < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in sub_simulate! "
+                                    f"energy_before={energy_before:.2f}uJ, energy_increment={energy_increment:.2f}uJ, "
+                                    f"energy_after={energy:.2f}uJ")
                 # Update the statistics.
+                # stage_execution_time and execution_time should have matching lengths
+                # execution_time is List[Tuple[str, float]] with (name, accumulated_time)
+                # stage_execution_time is List[float] with time for this iteration
+                # They should be in the same order: cells, then comms, then SendRecv (if num_stages > 1)
+                assert len(execution_time) == len(stage_execution_time), \
+                    f"Length mismatch: execution_time has {len(execution_time)} elements, " \
+                    f"stage_execution_time has {len(stage_execution_time)} elements"
                 for i in range(len(execution_time)):
                     execution_time[i] = (
                         execution_time[i][0],
@@ -734,6 +888,7 @@ class Simulator:
         num_attn_cell_replicas: int,
         input_lens_per_attn_replica: List[int],
         cached_lens_per_attn_replica: List[int],
+        prefix_cached_tokens_per_attn_replica: List[int],
         gpu_type: str,
         frequency: int,
         cluster_size_per_node: int,
@@ -771,10 +926,24 @@ class Simulator:
                         comp_type,
                         input_lens_per_attn_replica,
                         cached_lens_per_attn_replica,
+                        prefix_cached_tokens_per_attn_replica,
                         True,
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 elif task_type == "BiMHAHead":
                     exe_time, exe_energy = mha_time(
                         gpu_type,
@@ -783,28 +952,81 @@ class Simulator:
                         comp_type,
                         input_lens_per_attn_replica,
                         cached_lens_per_attn_replica,
+                        prefix_cached_tokens_per_attn_replica,
                         False,
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 elif task_type == "MLPFilter":
                     exe_time, exe_energy = mlp_time(
                         gpu_type, frequency, tasks, comp_type, num_input_tokens
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 elif task_type == "GLUFilter":
                     exe_time, exe_energy = glu_time(
                         gpu_type, frequency, tasks, comp_type, num_input_tokens
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 elif task_type == "SwiGLUFilter":
                     exe_time, exe_energy = swiglu_time(
                         gpu_type, frequency, tasks, comp_type, num_input_tokens
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 elif task_type.startswith("ExpertMLPFilter"):
                     # Each expert will get topk / E of the input tokens where E
                     # is the total number of experts.
@@ -819,6 +1041,19 @@ class Simulator:
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 elif task_type.startswith("ExpertSwiGLUFilter"):
                     num_total_experts = cell_schedule.cell.num_experts
                     topk = cell_schedule.cell.topk
@@ -831,10 +1066,41 @@ class Simulator:
                     )
                     cell_execution_time += exe_time
                     cell_execution_energy += exe_energy
+                    debug_log(f"[TIME] {task_type}: exe_time={exe_time:.2f}us, "
+                              f"cell_execution_time={cell_execution_time:.2f}us (accumulated)")
+                    if exe_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME from {task_type}! exe_time={exe_time:.2f}us")
+                    if cell_execution_time < 0:
+                        warning_log(f"[⚠️ALERT] NEGATIVE TIME accumulated in cell! cell_execution_time={cell_execution_time:.2f}us")
+                    if frequency != 0 and exe_energy != 0:
+                        debug_log(f"[ENERGY] {task_type}: exe_energy={exe_energy:.2f}uJ, "
+                                  f"cell_execution_energy={cell_execution_energy:.2f}uJ (accumulated)")
+                        if exe_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY from {task_type}! exe_energy={exe_energy:.2f}uJ")
+                        if cell_execution_energy < 0:
+                            warning_log(f"[⚠️ALERT] NEGATIVE ENERGY accumulated in cell! cell_execution_energy={cell_execution_energy:.2f}uJ")
                 else:
                     raise ValueError(f"Unsupported task type: {task_type}")
             execution_time.append(cell_execution_time)
-            execution_energy.append(cell_execution_energy * num_devices)
+            time_before_mult = cell_execution_time
+            time_after_mult = cell_execution_time  # Time doesn't multiply by num_devices (already parallelized)
+            debug_log(f"[TIME] Cell {i} ({cell_schedule.cell.get_name()}): "
+                      f"cell_execution_time={time_before_mult:.2f}us, "
+                      f"num_devices={num_devices}")
+            if time_before_mult < 0:
+                warning_log(f"[⚠️ALERT] NEGATIVE TIME in cell! cell_execution_time={time_before_mult:.2f}us")
+            energy_before_mult = cell_execution_energy
+            energy_after_mult = cell_execution_energy * num_devices
+            execution_energy.append(energy_after_mult)
+            if frequency != 0 and energy_after_mult != 0:
+                debug_log(f"[ENERGY] Cell {i} ({cell_schedule.cell.get_name()}): "
+                          f"cell_execution_energy={energy_before_mult:.2f}uJ, "
+                          f"num_devices={num_devices}, "
+                          f"energy_after_mult={energy_after_mult:.2f}uJ")
+                if energy_after_mult < 0:
+                    warning_log(f"[⚠️ALERT] NEGATIVE ENERGY after device multiplication! "
+                                f"energy_before_mult={energy_before_mult:.2f}uJ, num_devices={num_devices}, "
+                                f"energy_after_mult={energy_after_mult:.2f}uJ")
 
             if (
                 cell_schedule.cell.get_name() == "MoE"
@@ -881,9 +1147,46 @@ class Simulator:
                 execution_time.append(comm_time)
 
         # Multiply the block execution time by the number of blocks.
-        return [t * stage_schedule.num_blocks for t in execution_time], [
-            e * stage_schedule.num_blocks for e in execution_energy
-        ]
+        total_time_before = sum(execution_time)
+        execution_time_scaled = [t * stage_schedule.num_blocks for t in execution_time]
+        total_time_after = sum(execution_time_scaled)
+        debug_log(f"[TIME] get_stage_execution_time: num_blocks={stage_schedule.num_blocks}, "
+                  f"total_time_before={total_time_before:.2f}us, "
+                  f"total_time_after={total_time_after:.2f}us")
+        if total_time_before < 0:
+            warning_log(f"[⚠️ALERT] NEGATIVE TIME before num_blocks multiplication! "
+                        f"total_time_before={total_time_before:.2f}us")
+        if total_time_after < 0:
+            warning_log(f"[⚠️ALERT] NEGATIVE TIME after num_blocks multiplication! "
+                        f"num_blocks={stage_schedule.num_blocks}, total_time_after={total_time_after:.2f}us")
+        # Check individual scaled values
+        for idx, t_scaled in enumerate(execution_time_scaled):
+            if t_scaled < 0:
+                t_orig = execution_time[idx]
+                warning_log(f"[⚠️ALERT] NEGATIVE TIME in scaled value {idx}! "
+                            f"original={t_orig:.2f}us, num_blocks={stage_schedule.num_blocks}, "
+                            f"scaled={t_scaled:.2f}us")
+        total_energy_before = sum(execution_energy)
+        execution_energy_scaled = [e * stage_schedule.num_blocks for e in execution_energy]
+        total_energy_after = sum(execution_energy_scaled)
+        if frequency != 0 and total_energy_after != 0:
+            debug_log(f"[ENERGY] get_stage_execution_time: num_blocks={stage_schedule.num_blocks}, "
+                      f"total_energy_before={total_energy_before:.2f}uJ, "
+                      f"total_energy_after={total_energy_after:.2f}uJ")
+            if total_energy_before < 0:
+                warning_log(f"[⚠️ALERT] NEGATIVE ENERGY before num_blocks multiplication! "
+                            f"total_energy_before={total_energy_before:.2f}uJ")
+            if total_energy_after < 0:
+                warning_log(f"[⚠️ALERT] NEGATIVE ENERGY after num_blocks multiplication! "
+                            f"num_blocks={stage_schedule.num_blocks}, total_energy_after={total_energy_after:.2f}uJ")
+            # Check individual scaled values
+            for idx, e_scaled in enumerate(execution_energy_scaled):
+                if e_scaled < 0:
+                    e_orig = execution_energy[idx]
+                    warning_log(f"[⚠️ALERT] NEGATIVE ENERGY in scaled value {idx}! "
+                                f"original={e_orig:.2f}uJ, num_blocks={stage_schedule.num_blocks}, "
+                                f"scaled={e_scaled:.2f}uJ")
+        return execution_time_scaled, execution_energy_scaled
 
     def get_cross_stage_comm_time(
         self,

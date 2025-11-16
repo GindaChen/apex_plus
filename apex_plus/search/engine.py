@@ -225,7 +225,8 @@ class SearchEngine:
         model_config=[],
         ttft_slo = 10, 
         tpot_slo = 10, 
-        max_batch_size = 0) -> List[ExecutionPlan]:
+        max_batch_size = 0,
+        enable_pd_disaggregation: bool = False) -> List[ExecutionPlan]:
         """Search for the best execution plan."""
         candidate_plans = self.generate_plans(self.arch, self.cluster)
         print(f"Generated {len(candidate_plans)} {self.arch} candidate plans.")
@@ -245,7 +246,8 @@ class SearchEngine:
                 req_percentiles,
                 token_percentiles,
                 slo_targets, 
-                max_batch_size)
+                max_batch_size,
+                enable_pd_disaggregation)
             if output is None:
                 # Invalid plan (e.g., when the model does not fit in memory).
                 print(f"  [REJECTED] Plan {plan_idx + 1} is invalid (see reason above)")

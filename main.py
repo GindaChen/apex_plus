@@ -81,6 +81,7 @@ def main(args: argparse.Namespace):
             args.ttft_slo, 
             args.tpot_slo, 
             args.max_batch_size,
+            args.enable_pd_disaggregation,
         )  # updated traces by adding encode time
         trace = Trace(trace)
     if model.num_decoder_blocks > 0:
@@ -96,6 +97,7 @@ def main(args: argparse.Namespace):
             args.ttft_slo, 
             args.tpot_slo, 
             args.max_batch_size,
+            args.enable_pd_disaggregation,
         )
 
 
@@ -207,7 +209,14 @@ if __name__ == "__main__":
         type=int, 
         default=0,
         help="Define max batch size. This is also known as max number of sequences."
-        )
+    )
+    # Prefill/Decode disaggregation
+    parser.add_argument(
+        "--enable-pd-disaggregation",
+        action="store_true",
+        default=False,
+        help="Enable prefill/decode disaggregation. Separates prefill and decode processing.",
+    )
     args = parser.parse_args()
 
     main(args)

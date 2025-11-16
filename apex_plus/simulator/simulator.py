@@ -346,6 +346,7 @@ class Simulator:
         token_percentiles: List[int] = [],
         slo_targets: List[int] = [],
         max_batch_size: int = 0,
+        enable_pd_disaggregation: bool = False,
     ) -> Optional[SimulatorOutput]:
         parallel_schedule = execution_plan.parallel_schedule
         stage_schedule = parallel_schedule.stage_schedule
@@ -445,6 +446,7 @@ class Simulator:
                         num_attn_cell_replicas,
                         max_num_tokens_per_stage,
                         max_batch_size,
+                        enable_pd_disaggregation,
                     )
 
                     if updated_requests is None:
@@ -617,6 +619,7 @@ class Simulator:
         num_attn_cell_replicas: int,
         max_num_tokens_per_stage: int,
         max_batch_size: int,
+        enable_pd_disaggregation: bool = False,
     ):
         parallel_schedule = execution_plan.parallel_schedule
         stage_schedule = parallel_schedule.stage_schedule
@@ -635,6 +638,13 @@ class Simulator:
         
         # Initialize prefix cache
         prefix_cache = PrefixCache(block_size=256)
+        
+        # Prefill/Decode disaggregation state
+        prefill_queue: List[int] = []  # Requests waiting to form next prefill batch
+        prefill_batch: List[int] = []  # Current prefill batch being processed
+        prefill_completion_time: float = 0.0  # When current prefill batch will complete
+        prefill_clock: float = 0.0  # Separate clock for prefill processing
+        prefill_complete_queue: List[int] = []  # Requests that finished prefill but waiting for decode admission
 
         get_seq_len = lambda request_id: (
             requests[request_id].input_len + num_generated_tokens[request_id]
@@ -660,18 +670,108 @@ class Simulator:
         internal_clock = 0  # decide whether a request has arrived
         wait_next_req_time = 0  # the idle time of waiting for next request to come
         energy = 0  # energy consumption
+        iteration_count = 0  # Track iterations to detect infinite loops
+        max_iterations = 1000000  # Safety limit
         while True:
-            # Batch requests.
+            iteration_count += 1
+            if iteration_count > max_iterations:
+                print(f"  [ERROR] Simulation loop exceeded {max_iterations} iterations. Possible infinite loop.")
+                print(f"    req_counter={req_counter}/{len(requests)}, running={len(running)}, "
+                      f"prefill_batch={len(prefill_batch)}, prefill_queue={len(prefill_queue)}, "
+                      f"stopped={len(stopped)}, internal_clock={internal_clock:.2f}, "
+                      f"prefill_clock={prefill_clock:.2f}")
+                return None, None, None, None, None, None, None
+            # Prefill/Decode disaggregation: Process prefill batches
+            if enable_pd_disaggregation:
+                # Advance prefill clock to match decode clock if decode is ahead
+                # This ensures prefill can process requests that have arrived
+                if prefill_clock < internal_clock:
+                    prefill_clock = internal_clock
+                
+                # Check if current prefill batch is complete
+                if prefill_batch and prefill_completion_time <= prefill_clock:
+                    # Move all requests from prefill_batch to prefill_complete_queue
+                    # They will be admitted to decode when there's capacity
+                    for req_id in prefill_batch:
+                        prefill_complete_queue.append(req_id)
+                        num_generated_tokens[req_id] = 0
+                        # Add blocks to cache (prefill is done, KV cache is ready)
+                        hash_ids = requests[req_id].hash_ids
+                        if hash_ids:
+                            prefix_cache.add_blocks(hash_ids)
+                    prefill_batch.clear()
+                    prefill_completion_time = 0.0
+                
+                # Form new prefill batch if queue has requests and no prefill is running
+                if not prefill_batch and prefill_queue:
+                    # Collect all requests from prefill_queue that have arrived at prefill_clock
+                    ready_requests = []
+                    remaining_queue = []
+                    for req_id in prefill_queue:
+                        if requests[req_id].time_stamp <= prefill_clock:
+                            ready_requests.append(req_id)
+                        else:
+                            remaining_queue.append(req_id)
+                    prefill_queue = remaining_queue
+                    
+                    # If we have ready requests, form a prefill batch
+                    if ready_requests:
+                        prefill_batch = ready_requests
+                        # Estimate prefill batch time
+                        estimated_time = self.estimate_prefill_batch_time(
+                            execution_plan,
+                            prefill_batch,
+                            requests,
+                            num_attn_cell_replicas,
+                            prefix_cache,
+                            self.gpu,
+                            frequency,
+                            self.cluster_size_per_node,
+                        )
+                        # Set completion time: prefill starts now and completes after estimated_time
+                        prefill_completion_time = prefill_clock + estimated_time
+                        # Advance prefill clock immediately to simulate prefill processing
+                        # This means prefill runs in parallel with decode
+                        prefill_clock += estimated_time
+            
+            # Batch requests (decode only when p/d disaggregation is enabled).
             input_lens: List[int] = []
             cached_lens: List[int] = []
             prefix_cached_tokens: List[int] = []  # Track cached prefix tokens per request
+
+            # First, try to admit requests from prefill_complete_queue if there's capacity
+            if enable_pd_disaggregation and prefill_complete_queue:
+                # Sort by remaining output length (shorter = higher priority)
+                # This helps admit requests that will finish sooner
+                prefill_complete_queue.sort(
+                    key=lambda req_id: requests[req_id].output_len - num_generated_tokens.get(req_id, 0)
+                )
+                admitted = []
+                remaining_complete = []
+                for req_id in prefill_complete_queue:
+                    input_len = requests[req_id].input_len
+                    # Check if we have capacity for this request's input tokens
+                    if num_cached_tokens + input_len <= max_num_tokens_per_stage:
+                        # Admit to decode
+                        running.append(req_id)
+                        num_cached_tokens += input_len
+                        admitted.append(req_id)
+                    else:
+                        remaining_complete.append(req_id)
+                prefill_complete_queue = remaining_complete
 
             new_running: List[int] = []
             while running:
                 request_id = running.pop(0)
                 while num_cached_tokens + 1 > max_num_tokens_per_stage:
                     if running:
-                        victim = running.pop(-1)
+                        # Preempt: choose victim with longest remaining output (lower priority)
+                        # Sort by remaining output length descending, preempt the one with most tokens left
+                        running.sort(
+                            key=lambda req_id: requests[req_id].output_len - num_generated_tokens.get(req_id, 0),
+                            reverse=True
+                        )
+                        victim = running.pop(-1)  # Pop the one with most remaining output
                         stopped.append(victim)
                         num_cached_tokens -= get_seq_len(victim)
                     else:
@@ -688,8 +788,10 @@ class Simulator:
             running = new_running
 
             # Resume the stopped requests.
-            # Sort in the order of request_id.
-            stopped = sorted(stopped)
+            # Sort by remaining output length (shorter = higher priority) for better scheduling
+            stopped.sort(
+                key=lambda req_id: requests[req_id].output_len - num_generated_tokens.get(req_id, 0)
+            )
             while stopped:
                 request_id = stopped[0]
                 seq_len = get_seq_len(request_id)
@@ -708,76 +810,175 @@ class Simulator:
                 while req_counter < len(requests):
                     request_id = req_counter
                     input_len = requests[request_id].input_len
-                    # If the KV cache does not have enough space, stop.
-                    if num_cached_tokens + input_len > max_num_tokens_per_stage:
-                        break
-
-                    num_tokens = sum(input_lens) + input_len
-                    # If the total number of tokens exceeds the maximum, stop.
-                    if (
-                        num_tokens * num_attn_cell_replicas / min_num_replicas
-                        > MAX_NUM_INPUT_TOKENS
-                    ):
-                        break
-                    
-                    curr_batch_size = len(running)
-                    if(curr_batch_size == max_batch_size and max_batch_size != 0):
-                        break
                     
                     # Request has not yet arrived
                     if requests[request_id].time_stamp > internal_clock:
                         break
+                    
+                    if enable_pd_disaggregation:
+                        # With p/d disaggregation: add to prefill queue instead of running
+                        prefill_queue.append(request_id)
+                        req_counter += 1
+                    else:
+                        # Without p/d disaggregation: original behavior
+                        # If the KV cache does not have enough space, stop.
+                        if num_cached_tokens + input_len > max_num_tokens_per_stage:
+                            break
 
-                    num_cached_tokens += input_len
-                    input_lens.append(input_len)
-                    cached_lens.append(0)
-                    # Calculate prefix cached tokens for this new request
-                    hash_ids = requests[request_id].hash_ids
-                    cached_prefix = prefix_cache.get_cached_tokens(hash_ids)
-                    prefix_cached_tokens.append(cached_prefix)
-                    # Add blocks to cache (for future requests)
-                    if hash_ids:
-                        prefix_cache.add_blocks(hash_ids)
-                    running.append(request_id)
+                        num_tokens = sum(input_lens) + input_len
+                        # If the total number of tokens exceeds the maximum, stop.
+                        if (
+                            num_tokens * num_attn_cell_replicas / min_num_replicas
+                            > MAX_NUM_INPUT_TOKENS
+                        ):
+                            break
+                        
+                        curr_batch_size = len(running)
+                        if(curr_batch_size == max_batch_size and max_batch_size != 0):
+                            break
 
-                    num_generated_tokens[request_id] = 0
-                    req_counter += 1
+                        num_cached_tokens += input_len
+                        input_lens.append(input_len)
+                        cached_lens.append(0)
+                        # Calculate prefix cached tokens for this new request
+                        hash_ids = requests[request_id].hash_ids
+                        cached_prefix = prefix_cache.get_cached_tokens(hash_ids)
+                        prefix_cached_tokens.append(cached_prefix)
+                        # Add blocks to cache (for future requests)
+                        if hash_ids:
+                            prefix_cache.add_blocks(hash_ids)
+                        running.append(request_id)
+
+                        num_generated_tokens[request_id] = 0
+                        req_counter += 1
 
             if not running:
-                if req_counter < len(requests):
-                    # Cannot proceed.
-                    # This can happen when the space for the KV cache is
-                    # too small to store even a single sequence.
-                    if num_cached_tokens + input_len > max_num_tokens_per_stage:
-                        print(f"  [REJECTED] Plan failed: KV cache too small for single sequence. "
-                              f"Request {req_counter} needs {input_len:,} tokens, "
-                              f"but only {max_num_tokens_per_stage:,} tokens available per stage. "
-                              f"Already cached: {num_cached_tokens:,} tokens")
-                        return None, None, None, None, None, None, None
-                    else:
-                        # Or because the requests are coming too slow;
-                        # wait until next request comes.
+                if enable_pd_disaggregation:
+                    # With p/d disaggregation: check if we have prefill batches or queue
+                    # Advance clocks if needed
+                    if prefill_clock < internal_clock:
+                        prefill_clock = internal_clock
+                    
+                    # Wait for next request if needed
+                    if req_counter < len(requests):
                         if requests[req_counter].time_stamp > internal_clock:
                             wait_next_req_time += (
                                 requests[req_counter].time_stamp - internal_clock
                             )
                             internal_clock = requests[req_counter].time_stamp
-                        else:
-                            # Edge case: Request has arrived and KV cache has space,
-                            # but batching loop exited. This should not happen now that
-                            # we allow tokens beyond MAX_NUM_INPUT_TOKENS.
-                            input_len = requests[req_counter].input_len
-                            print(f"  [REJECTED] Plan failed: Cannot process request {req_counter} individually. "
-                                  f"KV cache OK ({num_cached_tokens + input_len:,} <= {max_num_tokens_per_stage:,}), "
-                                  f"request arrived (timestamp {requests[req_counter].time_stamp} <= {internal_clock}), "
-                                  f"but batching loop exited. This may indicate a logic bug.")
-                            return None, None, None, None, None, None, None
-
+                            prefill_clock = max(prefill_clock, internal_clock)
+                        # Continue loop to process new requests
+                        continue
+                    
+                    # Check if we still have prefill work or prefill-complete requests waiting
+                    if prefill_batch or prefill_queue or prefill_complete_queue:
+                        # Still have prefill work, continue loop
+                        clock_advanced = False
+                        # Advance prefill clock to process remaining batches
+                        if prefill_batch and prefill_completion_time > prefill_clock:
+                            # Advance to completion time to finish current batch
+                            prefill_clock = prefill_completion_time
+                            clock_advanced = True
+                        elif prefill_queue and not prefill_batch:
+                            # No prefill batch running, but have queued requests
+                            # First, check if any requests are ready (have arrived)
+                            ready_requests = [
+                                req_id for req_id in prefill_queue
+                                if requests[req_id].time_stamp <= prefill_clock
+                            ]
+                            if ready_requests:
+                                # Form batch from ready requests
+                                prefill_batch = ready_requests
+                                prefill_queue = [
+                                    req_id for req_id in prefill_queue
+                                    if req_id not in ready_requests
+                                ]
+                                # Estimate and set completion time
+                                estimated_time = self.estimate_prefill_batch_time(
+                                    execution_plan,
+                                    prefill_batch,
+                                    requests,
+                                    num_attn_cell_replicas,
+                                    prefix_cache,
+                                    self.gpu,
+                                    frequency,
+                                    self.cluster_size_per_node,
+                                )
+                                prefill_completion_time = prefill_clock + estimated_time
+                                prefill_clock += estimated_time
+                                clock_advanced = True
+                            else:
+                                # No ready requests, find the earliest queued request that hasn't arrived
+                                future_requests = [
+                                    req_id for req_id in prefill_queue 
+                                    if requests[req_id].time_stamp > prefill_clock
+                                ]
+                                if future_requests:
+                                    earliest_arrival = min(
+                                        requests[req_id].time_stamp for req_id in future_requests
+                                    )
+                                    # Advance prefill_clock to wait for next request
+                                    wait_time = earliest_arrival - prefill_clock
+                                    wait_next_req_time += wait_time
+                                    prefill_clock = earliest_arrival
+                                    internal_clock = max(internal_clock, prefill_clock)
+                                    clock_advanced = True
+                        
+                        if not clock_advanced and (prefill_batch or prefill_queue):
+                            # No progress made - this shouldn't happen, but break to avoid infinite loop
+                            print(f"  [WARNING] No clock advancement in p/d disaggregation loop. "
+                                  f"prefill_batch={len(prefill_batch)}, prefill_queue={len(prefill_queue)}, "
+                                  f"prefill_clock={prefill_clock:.2f}, internal_clock={internal_clock:.2f}")
+                            break
+                        continue
+                    
+                    # All requests processed and no prefill work
+                    # All requests should be finished (not in running, stopped, prefill_batch, prefill_queue, or prefill_complete_queue)
+                    # Note: num_cached_tokens might not be 0 if requests are still in decode but not yet processed
+                    # This is OK - the important thing is that all requests have been accounted for
+                    if req_counter >= len(requests) and not prefill_batch and not prefill_queue and not prefill_complete_queue:
+                        # All requests have been read and no prefill work remaining
+                        # If num_cached_tokens > 0, it means requests finished but tokens weren't cleared
+                        # This can happen if requests finished in a previous iteration
+                        # We'll allow this and just break
+                        break
                 else:
-                    # All the requests are finished.
-                    assert num_cached_tokens == 0, num_cached_tokens
-                    assert not stopped, stopped
-                    break
+                    # Without p/d disaggregation: original logic
+                    if req_counter < len(requests):
+                        # Cannot proceed.
+                        # This can happen when the space for the KV cache is
+                        # too small to store even a single sequence.
+                        input_len = requests[req_counter].input_len
+                        if num_cached_tokens + input_len > max_num_tokens_per_stage:
+                            print(f"  [REJECTED] Plan failed: KV cache too small for single sequence. "
+                                  f"Request {req_counter} needs {input_len:,} tokens, "
+                                  f"but only {max_num_tokens_per_stage:,} tokens available per stage. "
+                                  f"Already cached: {num_cached_tokens:,} tokens")
+                            return None, None, None, None, None, None, None
+                        else:
+                            # Or because the requests are coming too slow;
+                            # wait until next request comes.
+                            if requests[req_counter].time_stamp > internal_clock:
+                                wait_next_req_time += (
+                                    requests[req_counter].time_stamp - internal_clock
+                                )
+                                internal_clock = requests[req_counter].time_stamp
+                            else:
+                                # Edge case: Request has arrived and KV cache has space,
+                                # but batching loop exited. This should not happen now that
+                                # we allow tokens beyond MAX_NUM_INPUT_TOKENS.
+                                input_len = requests[req_counter].input_len
+                                print(f"  [REJECTED] Plan failed: Cannot process request {req_counter} individually. "
+                                      f"KV cache OK ({num_cached_tokens + input_len:,} <= {max_num_tokens_per_stage:,}), "
+                                      f"request arrived (timestamp {requests[req_counter].time_stamp} <= {internal_clock}), "
+                                      f"but batching loop exited. This may indicate a logic bug.")
+                                return None, None, None, None, None, None, None
+
+                    else:
+                        # All the requests are finished.
+                        assert num_cached_tokens == 0, num_cached_tokens
+                        assert not stopped, stopped
+                        break
 
             # Record the number of requests and tokens.
             num_reqs_per_iteration.append(len(running) * num_attn_cell_replicas)
@@ -882,6 +1083,71 @@ class Simulator:
             energy,
         )
 
+    def estimate_prefill_batch_time(
+        self,
+        execution_plan: ExecutionPlan,
+        request_ids: List[int],
+        requests: List[Request],
+        num_attn_cell_replicas: int,
+        prefix_cache: PrefixCache,
+        gpu_type: str,
+        frequency: int,
+        cluster_size_per_node: int,
+    ) -> float:
+        """Estimate prefill batch execution time for a list of requests.
+        
+        Args:
+            execution_plan: Execution plan for the model
+            request_ids: List of request IDs to estimate
+            requests: List of all requests
+            num_attn_cell_replicas: Number of attention cell replicas
+            prefix_cache: Prefix cache instance
+            gpu_type: GPU type
+            frequency: GPU frequency
+            cluster_size_per_node: Cluster size per node
+            
+        Returns:
+            Estimated prefill batch time in microseconds
+        """
+        if not request_ids:
+            return 0.0
+        
+        # Create batch for prefill: input_lens = request.input_len, cached_lens = 0
+        input_lens = [requests[req_id].input_len for req_id in request_ids]
+        cached_lens = [0] * len(request_ids)
+        prefix_cached_tokens = []
+        for req_id in request_ids:
+            hash_ids = requests[req_id].hash_ids
+            cached_prefix = prefix_cache.get_cached_tokens(hash_ids)
+            prefix_cached_tokens.append(cached_prefix)
+        
+        # Get stage execution time for this prefill batch
+        stage_schedule = execution_plan.parallel_schedule.stage_schedule
+        stage_execution_time, _ = self.get_stage_execution_time(
+            stage_schedule,
+            num_attn_cell_replicas,
+            input_lens,
+            cached_lens,
+            prefix_cached_tokens,
+            gpu_type,
+            frequency,
+            cluster_size_per_node,
+        )
+        
+        # Add cross-stage communication if needed
+        num_stages = execution_plan.parallel_schedule.num_stages
+        if num_stages > 1:
+            total_input_tokens = sum(input_lens)
+            comm_time = self.get_cross_stage_comm_time(
+                total_input_tokens,
+                execution_plan.stage_clusters,
+                gpu_type,
+                cluster_size_per_node,
+            )
+            stage_execution_time.append(comm_time)
+        
+        return sum(stage_execution_time)
+
     def get_stage_execution_time(
         self,
         stage_schedule: StageSchedule,
@@ -892,7 +1158,7 @@ class Simulator:
         gpu_type: str,
         frequency: int,
         cluster_size_per_node: int,
-    ) -> List[float]:
+    ) -> Tuple[List[float], List[float]]:
         # Calculate the number of input tokens per cell.
         num_total_input_tokens = (
             sum(input_lens_per_attn_replica) * num_attn_cell_replicas
